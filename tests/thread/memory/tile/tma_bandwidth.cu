@@ -3,8 +3,11 @@
 #ifdef TEST_THREAD_MEMORY_TILE_TMA_BW
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -214,8 +217,26 @@ float measure_kernel_ms(Kernel kernel,
 struct sweep_result {
     int sm_count;
     int blocks_for_saturation;
+    int blocks_for_peak;
     double max_gbps;
+    std::vector<double> gbps;
 };
+
+std::string csv_escape(const std::string &value) {
+    if (value.find_first_of(",\"") == std::string::npos) {
+        return value;
+    }
+    std::string escaped = "\"";
+    for (char c : value) {
+        if (c == '"') {
+            escaped += "\"\"";
+        } else {
+            escaped += c;
+        }
+    }
+    escaped += "\"";
+    return escaped;
+}
 
 template <typename LaunchFn>
 sweep_result run_sweep(const char *label,
@@ -262,7 +283,7 @@ sweep_result run_sweep(const char *label,
     std::cout << ">= " << std::fixed << std::setprecision(2) << (saturation_ratio * 100.0)
               << "% of peak at blocks=" << sat_blocks << "\n";
 
-    return {sm_count, sat_blocks, max_gbps};
+    return {sm_count, sat_blocks, max_blocks, max_gbps, std::move(bw)};
 }
 
 } // namespace
@@ -335,8 +356,9 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
     std::cout << "tile=" << (kTileH * 16) << "x" << (kTileW * 16)
               << " warps_per_block=" << kWarps << " ops_per_iter=" << kOps
               << " iters=" << kIters << "\n";
-    std::cout << "footprint_mb=" << static_cast<double>(num_elems * sizeof(dtype)) / (1024.0 * 1024.0)
-              << " l2_mb=" << static_cast<double>(prop.l2CacheSize) / (1024.0 * 1024.0) << "\n";
+    const double footprint_mb = static_cast<double>(num_elems * sizeof(dtype)) / (1024.0 * 1024.0);
+    const double l2_mb = static_cast<double>(prop.l2CacheSize) / (1024.0 * 1024.0);
+    std::cout << "footprint_mb=" << footprint_mb << " l2_mb=" << l2_mb << "\n";
     if (theoretical_bw > 0.0) {
         std::cout << "theoretical_hbm_gbps=" << std::fixed << std::setprecision(2)
                   << theoretical_bw << "\n";
@@ -369,8 +391,55 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
             kIters);
     };
 
-    run_sweep("tma_ld (gmem->smem) bandwidth sweep", sm_count, kWarps, kOps, tile_bytes, kIters, kSaturation, load_launch);
-    run_sweep("tma_st (smem->gmem) bandwidth sweep", sm_count, kWarps, kOps, tile_bytes, kIters, kSaturation, store_launch);
+    sweep_result load = run_sweep("tma_ld (gmem->smem) bandwidth sweep", sm_count, kWarps, kOps, tile_bytes, kIters, kSaturation, load_launch);
+    sweep_result store = run_sweep("tma_st (smem->gmem) bandwidth sweep", sm_count, kWarps, kOps, tile_bytes, kIters, kSaturation, store_launch);
+
+    std::string csv_path;
+    const char *env_csv = std::getenv("TMA_BW_CSV");
+    if (env_csv && env_csv[0] != '\0') {
+        csv_path = env_csv;
+    } else if (should_write_outputs) {
+        csv_path = "tma_bandwidth.csv";
+    }
+
+    if (!csv_path.empty()) {
+        std::ofstream csv(csv_path);
+        if (!csv) {
+            std::cerr << "WARNING: Failed to open CSV path: " << csv_path << "\n";
+        } else {
+            csv << "device,op,blocks,sm_count,gbps,peak_gbps,peak_blocks,saturation_ratio,saturation_blocks,"
+                << "warps_per_block,ops_per_iter,tile_h,tile_w,iters,tile_bytes,footprint_mb,l2_mb,theoretical_gbps\n";
+            csv << std::fixed << std::setprecision(6);
+
+            auto write_series = [&](const char *op, const sweep_result &result) {
+                for (int blocks = 1; blocks <= result.sm_count; ++blocks) {
+                    csv << csv_escape(prop.name) << ","
+                        << op << ","
+                        << blocks << ","
+                        << result.sm_count << ","
+                        << result.gbps[blocks] << ","
+                        << result.max_gbps << ","
+                        << result.blocks_for_peak << ","
+                        << kSaturation << ","
+                        << result.blocks_for_saturation << ","
+                        << kWarps << ","
+                        << kOps << ","
+                        << (kTileH * 16) << ","
+                        << (kTileW * 16) << ","
+                        << kIters << ","
+                        << tile_bytes << ","
+                        << footprint_mb << ","
+                        << l2_mb << ","
+                        << theoretical_bw
+                        << "\n";
+                }
+            };
+
+            write_series("ld", load);
+            write_series("st", store);
+            std::cout << "wrote_csv=" << csv_path << "\n";
+        }
+    }
 
     cudaFree(d_input);
     cudaFree(d_output);

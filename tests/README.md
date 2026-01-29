@@ -14,6 +14,20 @@ make clean
 make EXTRA_NVCCFLAGS=" -DTEST_THREAD_MEMORY_TILE_TMA_BW" run
 ```
 
+CSV output:
+
+```
+cd tests
+make clean
+TMA_BW_CSV=tma_bandwidth.csv make EXTRA_NVCCFLAGS=" -DTEST_THREAD_MEMORY_TILE_TMA_BW" run
+```
+
+Plot (requires matplotlib):
+
+```
+python plot_tma_bandwidth.py --csv tma_bandwidth.csv --out tma_bandwidth.png
+```
+
 Optional tunables (compile-time defines):
 
 * `TMA_BW_TILE_H` / `TMA_BW_TILE_W`: tile size in multiples of 16 (default 4x4).
