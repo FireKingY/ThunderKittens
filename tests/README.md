@@ -11,7 +11,7 @@ Build and run:
 ```
 cd tests
 make clean
-make NVCCFLAGS+=" -DTEST_THREAD_MEMORY_TILE_TMA_BW" run
+make EXTRA_NVCCFLAGS=" -DTEST_THREAD_MEMORY_TILE_TMA_BW" run
 ```
 
 Optional tunables (compile-time defines):
