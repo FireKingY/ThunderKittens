@@ -1,21 +1,19 @@
+#pragma once
+
 #include "testing_flags.cuh"
 
-#ifdef TEST_THREAD_MEMORY_TILE
+#ifdef TEST_THREAD_MEMORY_TILE_TMA_BW
 
 #include "testing_commons.cuh"
-
-#include "tma.cuh"
-#include "tma_bandwidth.cuh"
-#include "tma_multicast.cuh"
-#include "tma_pgl.cuh"
-#include "dsmem.cuh"
 
 namespace thread {
 namespace memory {
 namespace tile {
+namespace tma_bandwidth {
 
 void tests(test_data &results);
 
+}
 }
 }
 }

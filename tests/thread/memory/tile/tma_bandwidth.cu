@@ -1,0 +1,593 @@
+#include "tma_bandwidth.cuh"
+
+#ifdef TEST_THREAD_MEMORY_TILE_TMA_BW
+
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+namespace {
+
+#ifndef TMA_BW_TILE_H
+#define TMA_BW_TILE_H 4
+#endif
+
+#ifndef TMA_BW_TILE_W
+#define TMA_BW_TILE_W 4
+#endif
+
+#ifndef TMA_BW_WARPS_PER_BLOCK
+#define TMA_BW_WARPS_PER_BLOCK 4
+#endif
+
+#ifndef TMA_BW_OPS_PER_ITER
+#define TMA_BW_OPS_PER_ITER 4
+#endif
+
+#ifndef TMA_BW_ITERS
+#define TMA_BW_ITERS 2000
+#endif
+
+#ifndef TMA_BW_WARMUP
+#define TMA_BW_WARMUP 2
+#endif
+
+#ifndef TMA_BW_REPEATS
+#define TMA_BW_REPEATS 5
+#endif
+
+#ifndef TMA_BW_SATURATION
+#define TMA_BW_SATURATION 0.90f
+#endif
+
+template <typename T>
+__device__ inline float to_float(T v) {
+    return static_cast<float>(v);
+}
+
+template <>
+__device__ inline float to_float<kittens::bf16>(kittens::bf16 v) {
+    return __bfloat162float(v);
+}
+
+template <>
+__device__ inline float to_float<kittens::half>(kittens::half v) {
+    return __half2float(v);
+}
+
+template <typename T, int H, int W>
+using tile_t = kittens::st<T, 16 * H, 16 * W>;
+
+template <typename T, int H, int W>
+using bw_gl_t = kittens::gl<T, -1, -1, H * 16, W * 16, tile_t<T, H, W>>;
+
+template <typename T, int H, int W, int WARPS, int OPS, kittens::cache_policy POLICY>
+__global__ void tma_load_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> input,
+                                   float *sink,
+                                   int num_tiles,
+                                   int iters) {
+    extern __shared__ kittens::alignment_dummy __shm[];
+    kittens::tma_swizzle_allocator al((int *)&__shm[0]);
+    using tile_type = tile_t<T, H, W>;
+    tile_type (&tiles)[WARPS][OPS] = al.allocate<tile_type, WARPS, OPS>();
+
+    __shared__ kittens::semaphore sem[WARPS];
+
+    const int warp_id = kittens::warpid();
+    const int lane = kittens::laneid();
+    if (warp_id < WARPS && lane == 0) {
+        kittens::warp::init_semaphore(sem[warp_id], 0, 1);
+    }
+    __syncthreads();
+
+    if (warp_id >= WARPS) {
+        return;
+    }
+
+    constexpr uint32_t bytes_per_iter =
+        static_cast<uint32_t>(sizeof(T) * tile_type::num_elements * OPS);
+
+    float acc = 0.0f;
+    const int warp_stride = WARPS * OPS;
+    const int64_t grid_stride = static_cast<int64_t>(gridDim.x) * warp_stride;
+
+    for (int iter = 0; iter < iters; ++iter) {
+        int64_t base = static_cast<int64_t>(blockIdx.x) * warp_stride +
+                       warp_id * OPS +
+                       static_cast<int64_t>(iter) * grid_stride;
+
+        if (lane == 0) {
+            kittens::tma::expect_bytes(sem[warp_id], bytes_per_iter);
+        }
+
+        #pragma unroll
+        for (int op = 0; op < OPS; ++op) {
+            int tile = static_cast<int>((base + op) % num_tiles);
+            if (lane == 0) {
+                kittens::tma::load_async<kittens::dim::ROW, POLICY>(tiles[warp_id][op], input, {tile, 0, 0, 0}, sem[warp_id]);
+            }
+        }
+
+        kittens::wait(sem[warp_id], iter & 1);
+
+        if (lane == 0) {
+            acc += to_float(tiles[warp_id][0][0]);
+        }
+    }
+
+    if (lane == 0) {
+        sink[blockIdx.x * WARPS + warp_id] = acc;
+    }
+}
+
+template <typename T, int H, int W, int WARPS, int OPS, kittens::cache_policy POLICY>
+__global__ void tma_store_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> output,
+                                    int num_tiles,
+                                    int iters) {
+    extern __shared__ kittens::alignment_dummy __shm[];
+    kittens::tma_swizzle_allocator al((int *)&__shm[0]);
+    using tile_type = tile_t<T, H, W>;
+    tile_type (&tiles)[WARPS][OPS] = al.allocate<tile_type, WARPS, OPS>();
+
+    const int warp_id = kittens::warpid();
+    const int lane = kittens::laneid();
+    if (warp_id < WARPS) {
+        kittens::rt<T, 16 * H, 16 * W> reg_tile;
+        kittens::warp::one(reg_tile);
+        #pragma unroll
+        for (int op = 0; op < OPS; ++op) {
+            kittens::warp::store(tiles[warp_id][op], reg_tile);
+        }
+    }
+    __syncthreads();
+
+    if (warp_id >= WARPS) {
+        return;
+    }
+
+    const int warp_stride = WARPS * OPS;
+    const int64_t grid_stride = static_cast<int64_t>(gridDim.x) * warp_stride;
+
+    for (int iter = 0; iter < iters; ++iter) {
+        int64_t base = static_cast<int64_t>(blockIdx.x) * warp_stride +
+                       warp_id * OPS +
+                       static_cast<int64_t>(iter) * grid_stride;
+
+        #pragma unroll
+        for (int op = 0; op < OPS; ++op) {
+            int tile = static_cast<int>((base + op) % num_tiles);
+            if (lane == 0) {
+                kittens::tma::store_async<kittens::dim::ROW, POLICY>(output, tiles[warp_id][op], {tile, 0, 0, 0});
+            }
+        }
+        if (lane == 0) {
+            kittens::tma::store_async_wait<OPS - 1>();
+        }
+    }
+
+    if (lane == 0) {
+        kittens::tma::store_async_wait();
+    }
+}
+
+template <typename Kernel, typename... Args>
+float measure_kernel_ms(Kernel kernel,
+                        dim3 grid,
+                        dim3 block,
+                        size_t shared_bytes,
+                        int warmup,
+                        int repeats,
+                        Args... args) {
+    for (int i = 0; i < warmup; ++i) {
+        kernel<<<grid, block, shared_bytes>>>(args...);
+    }
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    float best_ms = std::numeric_limits<float>::max();
+    for (int i = 0; i < repeats; ++i) {
+        cudaEventRecord(start);
+        kernel<<<grid, block, shared_bytes>>>(args...);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        best_ms = std::min(best_ms, ms);
+    }
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return best_ms;
+}
+
+struct sweep_result {
+    int sm_count;
+    int blocks_for_saturation;
+    int blocks_for_peak;
+    double max_gbps;
+    std::vector<double> gbps;
+};
+
+std::string csv_escape(const std::string &value) {
+    if (value.find_first_of(",\"") == std::string::npos) {
+        return value;
+    }
+    std::string escaped = "\"";
+    for (char c : value) {
+        if (c == '"') {
+            escaped += "\"\"";
+        } else {
+            escaped += c;
+        }
+    }
+    escaped += "\"";
+    return escaped;
+}
+
+int env_to_int(const char *name, int fallback) {
+    const char *value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    char *end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return fallback;
+    }
+    if (parsed < 0) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
+std::string lower(std::string value) {
+    for (char &c : value) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return value;
+}
+
+kittens::cache_policy env_cache_policy() {
+    const char *value = std::getenv("TMA_BW_CACHE");
+    if (!value || value[0] == '\0') {
+        return kittens::cache_policy::NORMAL;
+    }
+    std::string token = lower(value);
+    if (token == "evict_first" || token == "evictfirst") {
+        return kittens::cache_policy::EVICT_FIRST;
+    }
+    if (token == "evict_last" || token == "evictlast") {
+        return kittens::cache_policy::EVICT_LAST;
+    }
+    return kittens::cache_policy::NORMAL;
+}
+
+const char *cache_policy_name(kittens::cache_policy policy) {
+    switch (policy) {
+        case kittens::cache_policy::EVICT_FIRST:
+            return "evict_first";
+        case kittens::cache_policy::EVICT_LAST:
+            return "evict_last";
+        default:
+            return "normal";
+    }
+}
+
+template <typename LaunchFn>
+sweep_result run_sweep(const char *label,
+                       int sm_count,
+                       int warps_per_block,
+                       int ops_per_iter,
+                       size_t tile_bytes,
+                       int iters,
+                       float saturation_ratio,
+                       const LaunchFn &launch) {
+    std::cout << "\n" << label << "\n";
+    std::cout << "blocks, sms, gbps\n";
+
+    double max_gbps = 0.0;
+    int max_blocks = 0;
+    std::vector<double> bw(sm_count + 1, 0.0);
+
+    for (int blocks = 1; blocks <= sm_count; ++blocks) {
+        float ms = launch(blocks);
+        double bytes = static_cast<double>(blocks) * warps_per_block * ops_per_iter *
+                       static_cast<double>(tile_bytes) * iters;
+        double gbps = bytes / (ms * 1e-3) / 1e9;
+        bw[blocks] = gbps;
+        if (gbps > max_gbps) {
+            max_gbps = gbps;
+            max_blocks = blocks;
+        }
+        std::cout << std::setw(6) << blocks << ", "
+                  << std::setw(4) << blocks << ", "
+                  << std::fixed << std::setprecision(2) << std::setw(8) << gbps << "\n";
+    }
+
+    int sat_blocks = max_blocks;
+    const double target = max_gbps * saturation_ratio;
+    for (int blocks = 1; blocks <= sm_count; ++blocks) {
+        if (bw[blocks] >= target) {
+            sat_blocks = blocks;
+            break;
+        }
+    }
+
+    std::cout << "peak_gbps=" << std::fixed << std::setprecision(2) << max_gbps
+              << " at blocks=" << max_blocks << "\n";
+    std::cout << ">= " << std::fixed << std::setprecision(2) << (saturation_ratio * 100.0)
+              << "% of peak at blocks=" << sat_blocks << "\n";
+
+    return {sm_count, sat_blocks, max_blocks, max_gbps, std::move(bw)};
+}
+
+} // namespace
+
+void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
+    std::cout << " ----- Starting ops/thread/memory/tile/tma_bandwidth test -----\n" << std::endl;
+
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, 0);
+
+    constexpr int kTileH = TMA_BW_TILE_H;
+    constexpr int kTileW = TMA_BW_TILE_W;
+    constexpr int kWarps = TMA_BW_WARPS_PER_BLOCK;
+    constexpr int kOps = TMA_BW_OPS_PER_ITER;
+    constexpr int kIters = TMA_BW_ITERS;
+    constexpr int kWarmup = TMA_BW_WARMUP;
+    constexpr int kRepeats = TMA_BW_REPEATS;
+    constexpr float kSaturation = TMA_BW_SATURATION;
+
+    using dtype = kittens::bf16;
+    using tile_type = tile_t<dtype, kTileH, kTileW>;
+    using gl_type = bw_gl_t<dtype, kTileH, kTileW>;
+
+    const int sm_count = prop.multiProcessorCount;
+    const size_t tile_bytes = sizeof(dtype) * tile_type::num_elements;
+
+    const int footprint_mb = env_to_int("TMA_BW_FOOTPRINT_MB", -1);
+    size_t target_bytes = 0;
+    if (footprint_mb > 0) {
+        target_bytes = static_cast<size_t>(footprint_mb) * 1024ull * 1024ull;
+        const size_t max_bytes = static_cast<size_t>(static_cast<double>(prop.totalGlobalMem) * 0.8);
+        if (target_bytes > max_bytes) {
+            std::cerr << "WARNING: Requested footprint " << footprint_mb
+                      << " MB exceeds 80% of device memory. Clamping to "
+                      << (max_bytes / (1024.0 * 1024.0)) << " MB.\n";
+            target_bytes = max_bytes;
+        }
+    } else {
+        target_bytes = std::max<size_t>(prop.l2CacheSize * 2, 64ull * 1024 * 1024);
+        target_bytes = std::min<size_t>(target_bytes, 512ull * 1024 * 1024);
+    }
+    const int num_tiles = static_cast<int>((target_bytes + tile_bytes - 1) / tile_bytes);
+    const size_t num_elems = static_cast<size_t>(num_tiles) * tile_type::num_elements;
+
+    dtype *d_input = nullptr;
+    dtype *d_output = nullptr;
+    float *d_sink = nullptr;
+
+    cudaMalloc(&d_input, num_elems * sizeof(dtype));
+    cudaMalloc(&d_output, num_elems * sizeof(dtype));
+    cudaMalloc(&d_sink, static_cast<size_t>(sm_count) * kWarps * sizeof(float));
+    cudaMemset(d_input, 0, num_elems * sizeof(dtype));
+    cudaMemset(d_output, 0, num_elems * sizeof(dtype));
+    cudaMemset(d_sink, 0, static_cast<size_t>(sm_count) * kWarps * sizeof(float));
+
+    gl_type input(d_input, num_tiles, 1, nullptr, nullptr);
+    gl_type output(d_output, num_tiles, 1, nullptr, nullptr);
+
+    const int threads = kWarps * kittens::WARP_THREADS;
+    const size_t shared_bytes = kittens::MAX_SHARED_MEMORY - 1024;
+
+    const kittens::cache_policy policy = env_cache_policy();
+    if (policy == kittens::cache_policy::EVICT_FIRST) {
+        cudaFuncSetAttribute(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+        cudaFuncSetAttribute(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    } else if (policy == kittens::cache_policy::EVICT_LAST) {
+        cudaFuncSetAttribute(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+        cudaFuncSetAttribute(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    } else {
+        cudaFuncSetAttribute(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+        cudaFuncSetAttribute(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    }
+
+    double theoretical_bw = 0.0;
+    int mem_clock_khz = 0;
+    int bus_width_bits = 0;
+    if (cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, 0) == cudaSuccess &&
+        cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, 0) == cudaSuccess &&
+        mem_clock_khz > 0 && bus_width_bits > 0) {
+        const double mem_clock_hz = static_cast<double>(mem_clock_khz) * 1000.0;
+        const double bus_bytes = static_cast<double>(bus_width_bits) / 8.0;
+        theoretical_bw = 2.0 * mem_clock_hz * bus_bytes / 1.0e9;
+    }
+
+    std::cout << "device=" << prop.name << " sm_count=" << sm_count << "\n";
+    std::cout << "tile=" << (kTileH * 16) << "x" << (kTileW * 16)
+              << " warps_per_block=" << kWarps << " ops_per_iter=" << kOps
+              << " iters=" << kIters << "\n";
+    const double footprint_mb = static_cast<double>(num_elems * sizeof(dtype)) / (1024.0 * 1024.0);
+    const double l2_mb = static_cast<double>(prop.l2CacheSize) / (1024.0 * 1024.0);
+    std::cout << "footprint_mb=" << footprint_mb << " l2_mb=" << l2_mb << "\n";
+    std::cout << "cache_policy=" << cache_policy_name(policy) << "\n";
+    if (theoretical_bw > 0.0) {
+        std::cout << "theoretical_hbm_gbps=" << std::fixed << std::setprecision(2)
+                  << theoretical_bw << "\n";
+    }
+
+    auto load_launch = [&](int blocks) {
+        if (policy == kittens::cache_policy::EVICT_FIRST) {
+            return measure_kernel_ms(
+                tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                input,
+                d_sink,
+                num_tiles,
+                kIters);
+        }
+        if (policy == kittens::cache_policy::EVICT_LAST) {
+            return measure_kernel_ms(
+                tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                input,
+                d_sink,
+                num_tiles,
+                kIters);
+        }
+        return measure_kernel_ms(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
+            dim3(blocks),
+            dim3(threads),
+            shared_bytes,
+            kWarmup,
+            kRepeats,
+            input,
+            d_sink,
+            num_tiles,
+            kIters);
+    };
+
+    auto store_launch = [&](int blocks) {
+        if (policy == kittens::cache_policy::EVICT_FIRST) {
+            return measure_kernel_ms(
+                tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                output,
+                num_tiles,
+                kIters);
+        }
+        if (policy == kittens::cache_policy::EVICT_LAST) {
+            return measure_kernel_ms(
+                tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                output,
+                num_tiles,
+                kIters);
+        }
+        return measure_kernel_ms(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
+            dim3(blocks),
+            dim3(threads),
+            shared_bytes,
+            kWarmup,
+            kRepeats,
+            output,
+            num_tiles,
+            kIters);
+    };
+
+    sweep_result load = run_sweep("tma_ld (gmem->smem) bandwidth sweep", sm_count, kWarps, kOps, tile_bytes, kIters, kSaturation, load_launch);
+    sweep_result store = run_sweep("tma_st (smem->gmem) bandwidth sweep", sm_count, kWarps, kOps, tile_bytes, kIters, kSaturation, store_launch);
+
+    std::string csv_path;
+    const char *env_csv = std::getenv("TMA_BW_CSV");
+    if (env_csv && env_csv[0] != '\0') {
+        csv_path = env_csv;
+    } else if (should_write_outputs) {
+        csv_path = "tma_bandwidth.csv";
+    }
+
+    if (!csv_path.empty()) {
+        std::ofstream csv(csv_path);
+        if (!csv) {
+            std::cerr << "WARNING: Failed to open CSV path: " << csv_path << "\n";
+        } else {
+            csv << "device,op,blocks,sm_count,gbps,peak_gbps,peak_blocks,saturation_ratio,saturation_blocks,"
+                << "warps_per_block,ops_per_iter,tile_h,tile_w,iters,tile_bytes,footprint_mb,l2_mb,theoretical_gbps,cache_policy\n";
+            csv << std::fixed << std::setprecision(6);
+
+            auto write_series = [&](const char *op, const sweep_result &result) {
+                for (int blocks = 1; blocks <= result.sm_count; ++blocks) {
+                    csv << csv_escape(prop.name) << ","
+                        << op << ","
+                        << blocks << ","
+                        << result.sm_count << ","
+                        << result.gbps[blocks] << ","
+                        << result.max_gbps << ","
+                        << result.blocks_for_peak << ","
+                        << kSaturation << ","
+                        << result.blocks_for_saturation << ","
+                        << kWarps << ","
+                        << kOps << ","
+                        << (kTileH * 16) << ","
+                        << (kTileW * 16) << ","
+                        << kIters << ","
+                        << tile_bytes << ","
+                        << footprint_mb << ","
+                        << l2_mb << ","
+                        << theoretical_bw << ","
+                        << cache_policy_name(policy)
+                        << "\n";
+                }
+            };
+
+            write_series("ld", load);
+            write_series("st", store);
+            std::cout << "wrote_csv=" << csv_path << "\n";
+        }
+    }
+
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_sink);
+
+    test_info info;
+    info.label = "tma_bandwidth_sweep";
+    info.result = test_result::PASSED;
+    results.push_back(info);
+
+    std::cout << std::endl;
+}
+
+#endif
