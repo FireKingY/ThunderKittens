@@ -22,6 +22,14 @@ make clean
 TMA_BW_CSV=tma_bandwidth.csv make EXTRA_NVCCFLAGS=" -DTEST_THREAD_MEMORY_TILE_TMA_BW" run
 ```
 
+HBM-focused sweep (larger footprint + L2 evict hint):
+
+```
+TMA_BW_FOOTPRINT_MB=2048 TMA_BW_CACHE=evict_first \
+  TMA_BW_CSV=tma_bandwidth.csv \
+  make EXTRA_NVCCFLAGS=" -DTEST_THREAD_MEMORY_TILE_TMA_BW" run
+```
+
 Plot (requires matplotlib):
 
 ```
@@ -37,5 +45,10 @@ Optional tunables (compile-time defines):
 * `TMA_BW_WARMUP`: warmup launches before timing (default 2).
 * `TMA_BW_REPEATS`: timed launches, best-of used (default 5).
 * `TMA_BW_SATURATION`: saturation ratio (default 0.90).
+
+Optional runtime env vars:
+* `TMA_BW_CSV`: write CSV to this path.
+* `TMA_BW_FOOTPRINT_MB`: override footprint (MB) to reduce L2 reuse.
+* `TMA_BW_CACHE`: `normal`, `evict_first`, or `evict_last`.
 
 Note: This test is only compiled on Hopper or Blackwell targets.

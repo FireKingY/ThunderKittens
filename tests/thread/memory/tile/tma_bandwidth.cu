@@ -69,7 +69,7 @@ using tile_t = kittens::st<T, 16 * H, 16 * W>;
 template <typename T, int H, int W>
 using bw_gl_t = kittens::gl<T, -1, -1, H * 16, W * 16, tile_t<T, H, W>>;
 
-template <typename T, int H, int W, int WARPS, int OPS>
+template <typename T, int H, int W, int WARPS, int OPS, kittens::cache_policy POLICY>
 __global__ void tma_load_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> input,
                                    float *sink,
                                    int num_tiles,
@@ -112,7 +112,7 @@ __global__ void tma_load_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> inpu
         for (int op = 0; op < OPS; ++op) {
             int tile = static_cast<int>((base + op) % num_tiles);
             if (lane == 0) {
-                kittens::tma::load_async(tiles[warp_id][op], input, {tile, 0, 0, 0}, sem[warp_id]);
+                kittens::tma::load_async<kittens::dim::ROW, POLICY>(tiles[warp_id][op], input, {tile, 0, 0, 0}, sem[warp_id]);
             }
         }
 
@@ -128,7 +128,7 @@ __global__ void tma_load_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> inpu
     }
 }
 
-template <typename T, int H, int W, int WARPS, int OPS>
+template <typename T, int H, int W, int WARPS, int OPS, kittens::cache_policy POLICY>
 __global__ void tma_store_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> output,
                                     int num_tiles,
                                     int iters) {
@@ -165,16 +165,16 @@ __global__ void tma_store_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> out
         for (int op = 0; op < OPS; ++op) {
             int tile = static_cast<int>((base + op) % num_tiles);
             if (lane == 0) {
-                kittens::tma::store_async(output, tiles[warp_id][op], {tile, 0, 0, 0});
+                kittens::tma::store_async<kittens::dim::ROW, POLICY>(output, tiles[warp_id][op], {tile, 0, 0, 0});
             }
         }
         if (lane == 0) {
-            kittens::tma::store_async_read_wait<OPS - 1>();
+            kittens::tma::store_async_wait<OPS - 1>();
         }
     }
 
     if (lane == 0) {
-        kittens::tma::store_async_read_wait();
+        kittens::tma::store_async_wait();
     }
 }
 
@@ -236,6 +236,57 @@ std::string csv_escape(const std::string &value) {
     }
     escaped += "\"";
     return escaped;
+}
+
+int env_to_int(const char *name, int fallback) {
+    const char *value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    char *end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return fallback;
+    }
+    if (parsed < 0) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
+std::string lower(std::string value) {
+    for (char &c : value) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return value;
+}
+
+kittens::cache_policy env_cache_policy() {
+    const char *value = std::getenv("TMA_BW_CACHE");
+    if (!value || value[0] == '\0') {
+        return kittens::cache_policy::NORMAL;
+    }
+    std::string token = lower(value);
+    if (token == "evict_first" || token == "evictfirst") {
+        return kittens::cache_policy::EVICT_FIRST;
+    }
+    if (token == "evict_last" || token == "evictlast") {
+        return kittens::cache_policy::EVICT_LAST;
+    }
+    return kittens::cache_policy::NORMAL;
+}
+
+const char *cache_policy_name(kittens::cache_policy policy) {
+    switch (policy) {
+        case kittens::cache_policy::EVICT_FIRST:
+            return "evict_first";
+        case kittens::cache_policy::EVICT_LAST:
+            return "evict_last";
+        default:
+            return "normal";
+    }
 }
 
 template <typename LaunchFn>
@@ -310,8 +361,21 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
     const int sm_count = prop.multiProcessorCount;
     const size_t tile_bytes = sizeof(dtype) * tile_type::num_elements;
 
-    size_t target_bytes = std::max<size_t>(prop.l2CacheSize * 2, 64ull * 1024 * 1024);
-    target_bytes = std::min<size_t>(target_bytes, 512ull * 1024 * 1024);
+    const int footprint_mb = env_to_int("TMA_BW_FOOTPRINT_MB", -1);
+    size_t target_bytes = 0;
+    if (footprint_mb > 0) {
+        target_bytes = static_cast<size_t>(footprint_mb) * 1024ull * 1024ull;
+        const size_t max_bytes = static_cast<size_t>(static_cast<double>(prop.totalGlobalMem) * 0.8);
+        if (target_bytes > max_bytes) {
+            std::cerr << "WARNING: Requested footprint " << footprint_mb
+                      << " MB exceeds 80% of device memory. Clamping to "
+                      << (max_bytes / (1024.0 * 1024.0)) << " MB.\n";
+            target_bytes = max_bytes;
+        }
+    } else {
+        target_bytes = std::max<size_t>(prop.l2CacheSize * 2, 64ull * 1024 * 1024);
+        target_bytes = std::min<size_t>(target_bytes, 512ull * 1024 * 1024);
+    }
     const int num_tiles = static_cast<int>((target_bytes + tile_bytes - 1) / tile_bytes);
     const size_t num_elems = static_cast<size_t>(num_tiles) * tile_type::num_elements;
 
@@ -332,14 +396,35 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
     const int threads = kWarps * kittens::WARP_THREADS;
     const size_t shared_bytes = kittens::MAX_SHARED_MEMORY - 1024;
 
-    cudaFuncSetAttribute(
-        tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shared_bytes);
-    cudaFuncSetAttribute(
-        tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shared_bytes);
+    const kittens::cache_policy policy = env_cache_policy();
+    if (policy == kittens::cache_policy::EVICT_FIRST) {
+        cudaFuncSetAttribute(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+        cudaFuncSetAttribute(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    } else if (policy == kittens::cache_policy::EVICT_LAST) {
+        cudaFuncSetAttribute(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+        cudaFuncSetAttribute(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    } else {
+        cudaFuncSetAttribute(
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+        cudaFuncSetAttribute(
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shared_bytes);
+    }
 
     double theoretical_bw = 0.0;
     int mem_clock_khz = 0;
@@ -359,14 +444,41 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
     const double footprint_mb = static_cast<double>(num_elems * sizeof(dtype)) / (1024.0 * 1024.0);
     const double l2_mb = static_cast<double>(prop.l2CacheSize) / (1024.0 * 1024.0);
     std::cout << "footprint_mb=" << footprint_mb << " l2_mb=" << l2_mb << "\n";
+    std::cout << "cache_policy=" << cache_policy_name(policy) << "\n";
     if (theoretical_bw > 0.0) {
         std::cout << "theoretical_hbm_gbps=" << std::fixed << std::setprecision(2)
                   << theoretical_bw << "\n";
     }
 
     auto load_launch = [&](int blocks) {
+        if (policy == kittens::cache_policy::EVICT_FIRST) {
+            return measure_kernel_ms(
+                tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                input,
+                d_sink,
+                num_tiles,
+                kIters);
+        }
+        if (policy == kittens::cache_policy::EVICT_LAST) {
+            return measure_kernel_ms(
+                tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                input,
+                d_sink,
+                num_tiles,
+                kIters);
+        }
         return measure_kernel_ms(
-            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps>,
+            tma_load_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
             dim3(blocks),
             dim3(threads),
             shared_bytes,
@@ -379,8 +491,32 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
     };
 
     auto store_launch = [&](int blocks) {
+        if (policy == kittens::cache_policy::EVICT_FIRST) {
+            return measure_kernel_ms(
+                tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_FIRST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                output,
+                num_tiles,
+                kIters);
+        }
+        if (policy == kittens::cache_policy::EVICT_LAST) {
+            return measure_kernel_ms(
+                tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::EVICT_LAST>,
+                dim3(blocks),
+                dim3(threads),
+                shared_bytes,
+                kWarmup,
+                kRepeats,
+                output,
+                num_tiles,
+                kIters);
+        }
         return measure_kernel_ms(
-            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps>,
+            tma_store_bw_kernel<dtype, kTileH, kTileW, kWarps, kOps, kittens::cache_policy::NORMAL>,
             dim3(blocks),
             dim3(threads),
             shared_bytes,
@@ -408,7 +544,7 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
             std::cerr << "WARNING: Failed to open CSV path: " << csv_path << "\n";
         } else {
             csv << "device,op,blocks,sm_count,gbps,peak_gbps,peak_blocks,saturation_ratio,saturation_blocks,"
-                << "warps_per_block,ops_per_iter,tile_h,tile_w,iters,tile_bytes,footprint_mb,l2_mb,theoretical_gbps\n";
+                << "warps_per_block,ops_per_iter,tile_h,tile_w,iters,tile_bytes,footprint_mb,l2_mb,theoretical_gbps,cache_policy\n";
             csv << std::fixed << std::setprecision(6);
 
             auto write_series = [&](const char *op, const sweep_result &result) {
@@ -430,7 +566,8 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
                         << tile_bytes << ","
                         << footprint_mb << ","
                         << l2_mb << ","
-                        << theoretical_bw
+                        << theoretical_bw << ","
+                        << cache_policy_name(policy)
                         << "\n";
                 }
             };
