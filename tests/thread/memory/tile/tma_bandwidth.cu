@@ -9,6 +9,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 namespace {
 
@@ -63,10 +64,10 @@ template <typename T, int H, int W>
 using tile_t = kittens::st<T, 16 * H, 16 * W>;
 
 template <typename T, int H, int W>
-using gl_t = kittens::gl<T, -1, -1, H * 16, W * 16, tile_t<T, H, W>>;
+using bw_gl_t = kittens::gl<T, -1, -1, H * 16, W * 16, tile_t<T, H, W>>;
 
 template <typename T, int H, int W, int WARPS, int OPS>
-__global__ void tma_load_bw_kernel(const __grid_constant__ gl_t<T, H, W> input,
+__global__ void tma_load_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> input,
                                    float *sink,
                                    int num_tiles,
                                    int iters) {
@@ -125,7 +126,7 @@ __global__ void tma_load_bw_kernel(const __grid_constant__ gl_t<T, H, W> input,
 }
 
 template <typename T, int H, int W, int WARPS, int OPS>
-__global__ void tma_store_bw_kernel(const __grid_constant__ gl_t<T, H, W> output,
+__global__ void tma_store_bw_kernel(const __grid_constant__ bw_gl_t<T, H, W> output,
                                     int num_tiles,
                                     int iters) {
     extern __shared__ kittens::alignment_dummy __shm[];
@@ -283,7 +284,7 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
 
     using dtype = kittens::bf16;
     using tile_type = tile_t<dtype, kTileH, kTileW>;
-    using gl_type = gl_t<dtype, kTileH, kTileW>;
+    using gl_type = bw_gl_t<dtype, kTileH, kTileW>;
 
     const int sm_count = prop.multiProcessorCount;
     const size_t tile_bytes = sizeof(dtype) * tile_type::num_elements;
@@ -320,9 +321,13 @@ void thread::memory::tile::tma_bandwidth::tests(test_data &results) {
         shared_bytes);
 
     double theoretical_bw = 0.0;
-    if (prop.memoryClockRate > 0 && prop.memoryBusWidth > 0) {
-        const double mem_clock_hz = static_cast<double>(prop.memoryClockRate) * 1000.0;
-        const double bus_bytes = static_cast<double>(prop.memoryBusWidth) / 8.0;
+    int mem_clock_khz = 0;
+    int bus_width_bits = 0;
+    if (cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, 0) == cudaSuccess &&
+        cudaDeviceGetAttribute(&bus_width_bits, cudaDevAttrGlobalMemoryBusWidth, 0) == cudaSuccess &&
+        mem_clock_khz > 0 && bus_width_bits > 0) {
+        const double mem_clock_hz = static_cast<double>(mem_clock_khz) * 1000.0;
+        const double bus_bytes = static_cast<double>(bus_width_bits) / 8.0;
         theoretical_bw = 2.0 * mem_clock_hz * bus_bytes / 1.0e9;
     }
 
