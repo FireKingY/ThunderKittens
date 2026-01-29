@@ -9,6 +9,11 @@ void thread::memory::tile::tests(test_data &results) {
 #else
     std::cout << "INFO: Skipping ops/thread/memory/tile/tma tests!\n" << std::endl;
 #endif
+#ifdef TEST_THREAD_MEMORY_TILE_TMA_BW
+    thread::memory::tile::tma_bandwidth::tests(results);
+#else
+    std::cout << "INFO: Skipping ops/thread/memory/tile/tma_bandwidth tests!\n" << std::endl;
+#endif
 #ifdef TEST_THREAD_MEMORY_TILE_TMA_MULTICAST
     thread::memory::tile::tma_multicast::tests(results);
 #else
